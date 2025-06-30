@@ -464,3 +464,309 @@
         )
     )
 )
+
+;; Secondary Market Trading System
+
+;; Secondary market listings
+(define-map token-listings
+    {
+        property-id: uint,
+        seller: principal,
+    }
+    {
+        tokens-for-sale: uint,
+        price-per-token: uint,
+        listed-at: uint,
+        active: bool,
+    }
+)
+
+;; Trading history
+(define-map trade-history
+    {
+        property-id: uint,
+        trade-id: uint,
+    }
+    {
+        seller: principal,
+        buyer: principal,
+        tokens-traded: uint,
+        price-per-token: uint,
+        total-amount: uint,
+        traded-at: uint,
+    }
+)
+
+(define-data-var trade-counter uint u0)
+
+;; Secondary market functions
+(define-public (list-tokens-for-sale
+        (property-id uint)
+        (tokens-to-sell uint)
+        (price-per-token uint)
+    )
+    (let (
+            (property (unwrap! (map-get? properties property-id) err-property-not-found))
+            (holding (unwrap!
+                (map-get? token-holdings {
+                    property-id: property-id,
+                    holder: tx-sender,
+                })
+                err-insufficient-tokens
+            ))
+            (existing-listing (map-get? token-listings {
+                property-id: property-id,
+                seller: tx-sender,
+            }))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-invalid-parameter)
+            (asserts! (get verified property) err-not-verified)
+            (asserts! (> tokens-to-sell u0) err-invalid-parameter)
+            (asserts! (> price-per-token u0) err-invalid-parameter)
+            (asserts! (<= tokens-to-sell (get tokens holding))
+                err-insufficient-tokens
+            )
+            (asserts! (is-none existing-listing) err-invalid-parameter)
+            (map-set token-listings {
+                property-id: property-id,
+                seller: tx-sender,
+            } {
+                tokens-for-sale: tokens-to-sell,
+                price-per-token: price-per-token,
+                listed-at: stacks-block-height,
+                active: true,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (cancel-listing (property-id uint))
+    (let ((listing (unwrap!
+            (map-get? token-listings {
+                property-id: property-id,
+                seller: tx-sender,
+            })
+            err-invalid-parameter
+        )))
+        (begin
+            (asserts! (get active listing) err-invalid-parameter)
+            (map-set token-listings {
+                property-id: property-id,
+                seller: tx-sender,
+            }
+                (merge listing { active: false })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (buy-listed-tokens
+        (property-id uint)
+        (seller principal)
+        (tokens-to-buy uint)
+    )
+    (let (
+            (property (unwrap! (map-get? properties property-id) err-property-not-found))
+            (listing (unwrap!
+                (map-get? token-listings {
+                    property-id: property-id,
+                    seller: seller,
+                })
+                err-invalid-parameter
+            ))
+            (seller-holding (unwrap!
+                (map-get? token-holdings {
+                    property-id: property-id,
+                    holder: seller,
+                })
+                err-insufficient-tokens
+            ))
+            (buyer-holding (default-to {
+                tokens: u0,
+                purchase-price: u0,
+                acquired-at: u0,
+            }
+                (map-get? token-holdings {
+                    property-id: property-id,
+                    holder: tx-sender,
+                })
+            ))
+            (total-cost (* tokens-to-buy (get price-per-token listing)))
+            (platform-fee (calculate-platform-fee total-cost))
+            (seller-amount (- total-cost platform-fee))
+            (trade-id (+ (var-get trade-counter) u1))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-invalid-parameter)
+            (asserts! (get active listing) err-invalid-parameter)
+            (asserts! (> tokens-to-buy u0) err-invalid-parameter)
+            (asserts! (<= tokens-to-buy (get tokens-for-sale listing))
+                err-insufficient-tokens
+            )
+            (asserts! (>= (stx-get-balance tx-sender) total-cost)
+                err-insufficient-funds
+            )
+            (asserts! (not (is-eq tx-sender seller)) err-invalid-parameter)
+            ;; Transfer payment to seller
+            (unwrap! (stx-transfer? seller-amount tx-sender seller)
+                err-insufficient-funds
+            )
+            ;; Transfer platform fee
+            (unwrap! (stx-transfer? platform-fee tx-sender contract-owner)
+                err-insufficient-funds
+            )
+            ;; Update seller's token holdings
+            (map-set token-holdings {
+                property-id: property-id,
+                holder: seller,
+            }
+                (merge seller-holding { tokens: (- (get tokens seller-holding) tokens-to-buy) })
+            )
+            ;; Update buyer's token holdings
+            (map-set token-holdings {
+                property-id: property-id,
+                holder: tx-sender,
+            } {
+                tokens: (+ (get tokens buyer-holding) tokens-to-buy),
+                purchase-price: (+ (get purchase-price buyer-holding) total-cost),
+                acquired-at: stacks-block-height,
+            })
+            ;; Update listing
+            (if (is-eq tokens-to-buy (get tokens-for-sale listing))
+                ;; Complete sale - deactivate listing
+                (map-set token-listings {
+                    property-id: property-id,
+                    seller: seller,
+                }
+                    (merge listing {
+                        active: false,
+                        tokens-for-sale: u0,
+                    })
+                )
+                ;; Partial sale - reduce available tokens
+                (map-set token-listings {
+                    property-id: property-id,
+                    seller: seller,
+                }
+                    (merge listing { tokens-for-sale: (- (get tokens-for-sale listing) tokens-to-buy) })
+                )
+            )
+            ;; Record trade history
+            (map-set trade-history {
+                property-id: property-id,
+                trade-id: trade-id,
+            } {
+                seller: seller,
+                buyer: tx-sender,
+                tokens-traded: tokens-to-buy,
+                price-per-token: (get price-per-token listing),
+                total-amount: total-cost,
+                traded-at: stacks-block-height,
+            })
+            ;; Update property statistics if new holder
+            (let ((current-stats (unwrap! (map-get? property-stats property-id)
+                    err-property-not-found
+                )))
+                (if (is-eq (get tokens buyer-holding) u0)
+                    (map-set property-stats property-id
+                        (merge current-stats { total-holders: (+ (get total-holders current-stats) u1) })
+                    )
+                    true
+                )
+            )
+            ;; Update platform fees and trade counter
+            (var-set total-platform-fees
+                (+ (var-get total-platform-fees) platform-fee)
+            )
+            (var-set trade-counter trade-id)
+            (ok trade-id)
+        )
+    )
+)
+
+(define-public (update-property-value
+        (property-id uint)
+        (new-value uint)
+    )
+    (let ((property (unwrap! (map-get? properties property-id) err-property-not-found)))
+        (begin
+            (asserts! (is-authorized-verifier tx-sender) err-not-authorized)
+            (asserts! (> new-value u0) err-invalid-parameter)
+            ;; Calculate appreciation rate
+            (let (
+                    (old-value (get property-value property))
+                    (appreciation-rate (if (> new-value old-value)
+                        (/ (* (- new-value old-value) u10000) old-value)
+                        u0
+                    ))
+                    (current-stats (unwrap! (map-get? property-stats property-id)
+                        err-property-not-found
+                    ))
+                )
+                ;; Update property value
+                (map-set properties property-id
+                    (merge property { property-value: new-value })
+                )
+                ;; Update appreciation rate in stats
+                (map-set property-stats property-id
+                    (merge current-stats { appreciation-rate: appreciation-rate })
+                )
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Read-only functions for secondary market
+(define-read-only (get-token-listing
+        (property-id uint)
+        (seller principal)
+    )
+    (map-get? token-listings {
+        property-id: property-id,
+        seller: seller,
+    })
+)
+
+(define-read-only (get-trade-history
+        (property-id uint)
+        (trade-id uint)
+    )
+    (map-get? trade-history {
+        property-id: property-id,
+        trade-id: trade-id,
+    })
+)
+
+(define-read-only (calculate-portfolio-value (holder principal))
+    (ok u0)
+    ;; Simplified - would iterate through all holdings in practice
+)
+
+;; Emergency functions
+(define-public (emergency-delist
+        (property-id uint)
+        (seller principal)
+    )
+    (let ((listing (unwrap!
+            (map-get? token-listings {
+                property-id: property-id,
+                seller: seller,
+            })
+            err-invalid-parameter
+        )))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (map-set token-listings {
+                property-id: property-id,
+                seller: seller,
+            }
+                (merge listing { active: false })
+            )
+            (ok true)
+        )
+    )
+)
