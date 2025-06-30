@@ -212,3 +212,255 @@
         )
     )
 )
+
+;; Token Purchase and Rental Income Distribution
+
+;; Token purchase functionality
+(define-public (purchase-tokens
+        (property-id uint)
+        (token-amount uint)
+    )
+    (let (
+            (property (unwrap! (map-get? properties property-id) err-property-not-found))
+            (token-price (/ (get property-value property) (get total-tokens property)))
+            (total-cost (* token-amount token-price))
+            (platform-fee (calculate-platform-fee total-cost))
+            (net-cost (+ total-cost platform-fee))
+            (current-holding (default-to {
+                tokens: u0,
+                purchase-price: u0,
+                acquired-at: u0,
+            }
+                (map-get? token-holdings {
+                    property-id: property-id,
+                    holder: tx-sender,
+                })
+            ))
+            (current-stats (unwrap! (map-get? property-stats property-id) err-property-not-found))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-invalid-parameter)
+            (asserts! (get verified property) err-not-verified)
+            (asserts! (get active property) err-property-not-active)
+            (asserts! (> token-amount u0) err-invalid-parameter)
+            (asserts! (<= token-amount (get available-tokens property))
+                err-insufficient-tokens
+            )
+            (asserts! (>= (stx-get-balance tx-sender) net-cost)
+                err-insufficient-funds
+            )
+            ;; Transfer payment to property owner
+            (unwrap! (stx-transfer? total-cost tx-sender (get owner property))
+                err-insufficient-funds
+            )
+            ;; Transfer platform fee
+            (unwrap! (stx-transfer? platform-fee tx-sender contract-owner)
+                err-insufficient-funds
+            )
+            ;; Update property available tokens
+            (map-set properties property-id
+                (merge property { available-tokens: (- (get available-tokens property) token-amount) })
+            )
+            ;; Update token holdings
+            (map-set token-holdings {
+                property-id: property-id,
+                holder: tx-sender,
+            } {
+                tokens: (+ (get tokens current-holding) token-amount),
+                purchase-price: (+ (get purchase-price current-holding) total-cost),
+                acquired-at: stacks-block-height,
+            })
+            ;; Update property statistics
+            (map-set property-stats property-id
+                (merge current-stats { total-holders: (if (is-eq (get tokens current-holding) u0)
+                    (+ (get total-holders current-stats) u1)
+                    (get total-holders current-stats)
+                ) }
+                ))
+            ;; Update platform fees
+            (var-set total-platform-fees
+                (+ (var-get total-platform-fees) platform-fee)
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Rental income distribution
+(define-map rental-distributions
+    {
+        property-id: uint,
+        distribution-id: uint,
+    }
+    {
+        total-amount: uint,
+        per-token-amount: uint,
+        distribution-date: uint,
+        claimed-amount: uint,
+    }
+)
+
+(define-map distribution-claims
+    {
+        property-id: uint,
+        distribution-id: uint,
+        holder: principal,
+    }
+    {
+        amount: uint,
+        claimed-at: uint,
+    }
+)
+
+(define-data-var distribution-counter uint u0)
+
+(define-public (distribute-rental-income
+        (property-id uint)
+        (total-amount uint)
+    )
+    (let (
+            (property (unwrap! (map-get? properties property-id) err-property-not-found))
+            (distribution-id (+ (var-get distribution-counter) u1))
+            (per-token-amount (/ total-amount (get total-tokens property)))
+            (current-stats (unwrap! (map-get? property-stats property-id) err-property-not-found))
+        )
+        (begin
+            (asserts! (is-eq tx-sender (get owner property)) err-not-authorized)
+            (asserts! (get verified property) err-not-verified)
+            (asserts! (> total-amount u0) err-invalid-parameter)
+            (asserts! (>= (stx-get-balance tx-sender) total-amount)
+                err-insufficient-funds
+            )
+            ;; Create distribution record
+            (map-set rental-distributions {
+                property-id: property-id,
+                distribution-id: distribution-id,
+            } {
+                total-amount: total-amount,
+                per-token-amount: per-token-amount,
+                distribution-date: stacks-block-height,
+                claimed-amount: u0,
+            })
+            ;; Update property statistics
+            (map-set property-stats property-id
+                (merge current-stats {
+                    total-distributed: (+ (get total-distributed current-stats) total-amount),
+                    last-distribution: stacks-block-height,
+                })
+            )
+            (var-set distribution-counter distribution-id)
+            (ok distribution-id)
+        )
+    )
+)
+
+(define-public (claim-rental-income
+        (property-id uint)
+        (distribution-id uint)
+    )
+    (let (
+            (property (unwrap! (map-get? properties property-id) err-property-not-found))
+            (distribution (unwrap!
+                (map-get? rental-distributions {
+                    property-id: property-id,
+                    distribution-id: distribution-id,
+                })
+                err-invalid-parameter
+            ))
+            (holding (unwrap!
+                (map-get? token-holdings {
+                    property-id: property-id,
+                    holder: tx-sender,
+                })
+                err-insufficient-tokens
+            ))
+            (claim-amount (* (get tokens holding) (get per-token-amount distribution)))
+            (existing-claim (map-get? distribution-claims {
+                property-id: property-id,
+                distribution-id: distribution-id,
+                holder: tx-sender,
+            }))
+        )
+        (begin
+            (asserts! (is-none existing-claim) err-invalid-parameter)
+            (asserts! (> claim-amount u0) err-insufficient-tokens)
+            ;; Transfer rental income from property owner to token holder
+            (unwrap! (stx-transfer? claim-amount (get owner property) tx-sender)
+                err-insufficient-funds
+            )
+            ;; Record claim
+            (map-set distribution-claims {
+                property-id: property-id,
+                distribution-id: distribution-id,
+                holder: tx-sender,
+            } {
+                amount: claim-amount,
+                claimed-at: stacks-block-height,
+            })
+            ;; Update distribution claimed amount
+            (map-set rental-distributions {
+                property-id: property-id,
+                distribution-id: distribution-id,
+            }
+                (merge distribution { claimed-amount: (+ (get claimed-amount distribution) claim-amount) })
+            )
+            (ok claim-amount)
+        )
+    )
+)
+
+;; Read-only functions for distributions
+(define-read-only (get-distribution-details
+        (property-id uint)
+        (distribution-id uint)
+    )
+    (map-get? rental-distributions {
+        property-id: property-id,
+        distribution-id: distribution-id,
+    })
+)
+
+(define-read-only (get-claim-details
+        (property-id uint)
+        (distribution-id uint)
+        (holder principal)
+    )
+    (map-get? distribution-claims {
+        property-id: property-id,
+        distribution-id: distribution-id,
+        holder: holder,
+    })
+)
+
+(define-read-only (calculate-claimable-income
+        (property-id uint)
+        (distribution-id uint)
+        (holder principal)
+    )
+    (let (
+            (distribution (unwrap!
+                (map-get? rental-distributions {
+                    property-id: property-id,
+                    distribution-id: distribution-id,
+                })
+                (err u0)
+            ))
+            (holding (unwrap!
+                (map-get? token-holdings {
+                    property-id: property-id,
+                    holder: holder,
+                })
+                (err u0)
+            ))
+            (existing-claim (map-get? distribution-claims {
+                property-id: property-id,
+                distribution-id: distribution-id,
+                holder: holder,
+            }))
+        )
+        (if (is-some existing-claim)
+            (ok u0)
+            (ok (* (get tokens holding) (get per-token-amount distribution)))
+        )
+    )
+)
