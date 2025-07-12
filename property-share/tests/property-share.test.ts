@@ -1006,3 +1006,821 @@ describe("Token Purchase", () => {
       expect(result).toBeErr(Cl.uint(0));
     });
   });
+
+describe("Secondary Market Trading", () => {
+    beforeEach(() => {
+      // Setup: Create property, verify, and establish token holders
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Trading Property"),
+        Cl.stringUtf8("Trading Location"),
+        Cl.uint(1000000000), // 1000 STX
+        Cl.uint(1000), // 1000 tokens
+        Cl.uint(15000000) // 15 STX monthly rent
+      ], address1);
+      
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      
+      // Initial token holders
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(400)], address2); // 40%
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(300)], address3); // 30%
+    });
+
+    it("allows token holder to list tokens for sale", () => {
+      const tokensToSell = 150;
+      const pricePerToken = 1200000; // 1.2 STX per token (20% premium)
+      
+      const { result } = simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(tokensToSell),
+        Cl.uint(pricePerToken)
+      ], address2);
+      
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("prevents listing more tokens than owned", () => {
+      const { result } = simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(500), // address2 only has 400 tokens
+        Cl.uint(1200000)
+      ], address2);
+      
+      expect(result).toBeErr(Cl.uint(103)); // err-insufficient-tokens
+    });
+
+    it("prevents listing zero tokens", () => {
+      const { result } = simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(0), // Zero tokens
+        Cl.uint(1200000)
+      ], address2);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("prevents listing with zero price", () => {
+      const { result } = simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(100),
+        Cl.uint(0) // Zero price
+      ], address2);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("prevents duplicate listings by same user", () => {
+      // First listing
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(100),
+        Cl.uint(1200000)
+      ], address2);
+      
+      // Second listing attempt
+      const { result } = simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(200),
+        Cl.uint(1300000)
+      ], address2);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("prevents listing from unverified property", () => {
+      // Create unverified property
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Unverified Trading"),
+        Cl.stringUtf8("Location"),
+        Cl.uint(500000000),
+        Cl.uint(500),
+        Cl.uint(5000000)
+      ], address1);
+      
+      const { result } = simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(2), // Unverified property
+        Cl.uint(100),
+        Cl.uint(1000000)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(108)); // err-not-verified
+    });
+
+    it("retrieves listing details correctly", () => {
+      const tokensToSell = 200;
+      const pricePerToken = 1500000; // 1.5 STX per token
+      
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(tokensToSell),
+        Cl.uint(pricePerToken)
+      ], address2);
+      
+      const { result } = simnet.callReadOnlyFn(contractName, "get-token-listing", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], address1);
+      
+      expect(result).toBeSome(
+        Cl.tuple({
+          "tokens-for-sale": Cl.uint(tokensToSell),
+          "price-per-token": Cl.uint(pricePerToken),
+          "listed-at": Cl.uint(simnet.blockHeight),
+          active: Cl.bool(true),
+        })
+      );
+    });
+
+    it("allows canceling active listing", () => {
+      // Create listing
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(150),
+        Cl.uint(1200000)
+      ], address2);
+      
+      // Cancel listing
+      const { result } = simnet.callPublicFn(contractName, "cancel-listing", [Cl.uint(1)], address2);
+      expect(result).toBeOk(Cl.bool(true));
+      
+      // Check listing is deactivated
+      const { result: listing } = simnet.callReadOnlyFn(contractName, "get-token-listing", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], address1);
+      
+      expect(listing).toBeSome(
+        Cl.tuple({
+          "tokens-for-sale": Cl.uint(150),
+          "price-per-token": Cl.uint(1200000),
+          "listed-at": Cl.uint(expect.any(Number)),
+          active: Cl.bool(false),
+        })
+      );
+    });
+
+    it("prevents canceling non-existent listing", () => {
+      const { result } = simnet.callPublicFn(contractName, "cancel-listing", [Cl.uint(1)], address3);
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("prevents listing when contract is paused", () => {
+      simnet.callPublicFn(contractName, "toggle-contract-pause", [], deployer);
+      
+      const { result } = simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(100),
+        Cl.uint(1200000)
+      ], address2);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+  });
+
+  describe("Token Purchase from Secondary Market", () => {
+    beforeEach(() => {
+      // Setup: Create property, verify, establish holders, and create listing
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Market Property"),
+        Cl.stringUtf8("Market Location"),
+        Cl.uint(1000000000),
+        Cl.uint(1000),
+        Cl.uint(15000000)
+      ], address1);
+      
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      
+      // Token holders
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(500)], address2);
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(300)], address3);
+      
+      // Create listing
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(200), // 200 tokens for sale
+        Cl.uint(1200000) // 1.2 STX per token
+      ], address2);
+    });
+
+    it("allows buying listed tokens", () => {
+      const tokensToBuy = 100;
+      const { result } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2), // seller
+        Cl.uint(tokensToBuy)
+      ], address3);
+      
+      expect(result).toBeOk(Cl.uint(1)); // First trade ID
+    });
+
+    it("updates buyer holdings after purchase", () => {
+      const tokensToBuy = 150;
+      simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(tokensToBuy)
+      ], address3);
+      
+      // Check buyer's updated holdings (300 + 150 = 450)
+      const { result } = simnet.callReadOnlyFn(contractName, "get-token-holdings", [
+        Cl.uint(1),
+        Cl.principal(address3)
+      ], address1);
+      
+      expect(result).toBeSome(
+        Cl.tuple({
+          tokens: Cl.uint(450),
+          "purchase-price": Cl.uint(480000000), // Original 300 STX + 180 STX for 150 tokens at 1.2 STX each
+          "acquired-at": Cl.uint(simnet.blockHeight),
+        })
+      );
+    });
+
+    it("updates seller holdings after sale", () => {
+      const tokensToBuy = 100;
+      simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(tokensToBuy)
+      ], address3);
+      
+      // Check seller's reduced holdings (500 - 100 = 400)
+      const { result } = simnet.callReadOnlyFn(contractName, "get-token-holdings", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], address1);
+      
+      expect(result).toBeSome(
+        Cl.tuple({
+          tokens: Cl.uint(400),
+          "purchase-price": Cl.uint(500000000), // Original purchase price unchanged
+          "acquired-at": Cl.uint(expect.any(Number)),
+        })
+      );
+    });
+
+    it("records trade history correctly", () => {
+      const tokensToBuy = 75;
+      simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(tokensToBuy)
+      ], address3);
+      
+      const { result } = simnet.callReadOnlyFn(contractName, "get-trade-history", [
+        Cl.uint(1),
+        Cl.uint(1)
+      ], address1);
+      
+      expect(result).toBeSome(
+        Cl.tuple({
+          seller: Cl.principal(address2),
+          buyer: Cl.principal(address3),
+          "tokens-traded": Cl.uint(tokensToBuy),
+          "price-per-token": Cl.uint(1200000),
+          "total-amount": Cl.uint(90000000), // 75 * 1.2 STX = 90 STX
+          "traded-at": Cl.uint(simnet.blockHeight),
+        })
+      );
+    });
+
+    it("handles partial listing fulfillment", () => {
+      const tokensToBuy = 50; // Less than 200 available
+      simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(tokensToBuy)
+      ], address3);
+      
+      // Check listing still active with reduced tokens
+      const { result } = simnet.callReadOnlyFn(contractName, "get-token-listing", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], address1);
+      
+      expect(result).toBeSome(
+        Cl.tuple({
+          "tokens-for-sale": Cl.uint(150), // 200 - 50
+          "price-per-token": Cl.uint(1200000),
+          "listed-at": Cl.uint(expect.any(Number)),
+          active: Cl.bool(true),
+        })
+      );
+    });
+
+    it("deactivates listing when fully purchased", () => {
+      const tokensToBuy = 200; // All available tokens
+      simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(tokensToBuy)
+      ], address3);
+      
+      // Check listing is deactivated
+      const { result } = simnet.callReadOnlyFn(contractName, "get-token-listing", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], address1);
+      
+      expect(result).toBeSome(
+        Cl.tuple({
+          "tokens-for-sale": Cl.uint(0),
+          "price-per-token": Cl.uint(1200000),
+          "listed-at": Cl.uint(expect.any(Number)),
+          active: Cl.bool(false),
+        })
+      );
+    });
+
+    it("prevents buying more tokens than listed", () => {
+      const { result } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(300) // More than 200 available
+      ], address3);
+      
+      expect(result).toBeErr(Cl.uint(103)); // err-insufficient-tokens
+    });
+
+    it("prevents buying zero tokens", () => {
+      const { result } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(0) // Zero tokens
+      ], address3);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("prevents seller from buying own tokens", () => {
+      const { result } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2), // seller
+        Cl.uint(100)
+      ], address2); // Same as seller
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("prevents buying from inactive listing", () => {
+      // Cancel listing first
+      simnet.callPublicFn(contractName, "cancel-listing", [Cl.uint(1)], address2);
+      
+      const { result } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(100)
+      ], address3);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("includes platform fee in secondary market trades", () => {
+      const tokensToBuy = 100;
+      // Total cost: 100 * 1.2 STX = 120 STX
+      // Platform fee: 2% of 120 STX = 2.4 STX
+      // Seller receives: 120 - 2.4 = 117.6 STX
+      
+      const { result } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(tokensToBuy)
+      ], address3);
+      
+      expect(result).toBeOk(Cl.uint(1));
+    });
+
+    it("updates property holder count for new buyers", () => {
+      // Buy tokens with a new address that doesn't have any tokens yet
+      simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(100)
+      ], deployer); // New token holder
+      
+      const { result } = simnet.callReadOnlyFn(contractName, "get-property-stats", [Cl.uint(1)], address1);
+      expect(result).toBeSome(
+        Cl.tuple({
+          "total-holders": Cl.uint(3), // address2, address3, deployer
+          "total-distributed": Cl.uint(0),
+          "last-distribution": Cl.uint(0),
+          "appreciation-rate": Cl.uint(0),
+        })
+      );
+    });
+
+    it("prevents buying when contract is paused", () => {
+      simnet.callPublicFn(contractName, "toggle-contract-pause", [], deployer);
+      
+      const { result } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(100)
+      ], address3);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+  });
+
+  describe("Emergency Controls", () => {
+    beforeEach(() => {
+      // Setup: Create property and establish secondary market
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Emergency Property"),
+        Cl.stringUtf8("Emergency Location"),
+        Cl.uint(800000000),
+        Cl.uint(800),
+        Cl.uint(12000000)
+      ], address1);
+      
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(300)], address2);
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(100),
+        Cl.uint(1500000)
+      ], address2);
+    });
+
+    it("allows owner to emergency delist", () => {
+      const { result } = simnet.callPublicFn(contractName, "emergency-delist", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], deployer);
+      
+      expect(result).toBeOk(Cl.bool(true));
+      
+      // Check listing is deactivated
+      const { result: listing } = simnet.callReadOnlyFn(contractName, "get-token-listing", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], address1);
+      
+      expect(listing).toBeSome(
+        Cl.tuple({
+          "tokens-for-sale": Cl.uint(100),
+          "price-per-token": Cl.uint(1500000),
+          "listed-at": Cl.uint(expect.any(Number)),
+          active: Cl.bool(false),
+        })
+      );
+    });
+
+    it("prevents non-owner from emergency delisting", () => {
+      const { result } = simnet.callPublicFn(contractName, "emergency-delist", [
+        Cl.uint(1),
+        Cl.principal(address2)
+      ], address1); // Not the contract owner
+      
+      expect(result).toBeErr(Cl.uint(100)); // err-owner-only
+    });
+
+    it("prevents emergency delisting non-existent listing", () => {
+      const { result } = simnet.callPublicFn(contractName, "emergency-delist", [
+        Cl.uint(1),
+        Cl.principal(address3) // No listing
+      ], deployer);
+      
+      expect(result).toBeErr(Cl.uint(105)); // err-invalid-parameter
+    });
+
+    it("allows contract owner to withdraw platform fees", () => {
+      // Generate some platform fees first through token purchases
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(100)], address3);
+      
+      const { result } = simnet.callPublicFn(contractName, "withdraw-platform-fees", [], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("prevents non-owner from withdrawing platform fees", () => {
+      const { result } = simnet.callPublicFn(contractName, "withdraw-platform-fees", [], address1);
+      expect(result).toBeErr(Cl.uint(100)); // err-owner-only
+    });
+  });
+
+  describe("Integration Tests", () => {
+    it("complete property lifecycle with all features", () => {
+      // 1. Create property
+      const { result: propertyResult } = simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Complete Lifecycle Property"),
+        Cl.stringUtf8("Premium Downtown Location"),
+        Cl.uint(2000000000), // 2000 STX value
+        Cl.uint(2000), // 2000 tokens
+        Cl.uint(40000000) // 40 STX monthly rent
+      ], address1);
+      expect(propertyResult).toBeOk(Cl.uint(1));
+      
+      // 2. Add verifier and verify property
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      const { result: verifyResult } = simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      expect(verifyResult).toBeOk(Cl.bool(true));
+      
+      // 3. Multiple investors purchase tokens
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(600)], address2); // 30%
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(800)], address3); // 40%
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(400)], deployer); // 20%
+      
+      // 4. Property owner distributes rental income
+      const { result: distributionResult } = simnet.callPublicFn(contractName, "distribute-rental-income", [
+        Cl.uint(1),
+        Cl.uint(40000000) // 40 STX
+      ], address1);
+      expect(distributionResult).toBeOk(Cl.uint(1));
+      
+      // 5. Token holders claim their rental income
+      const { result: claim1 } = simnet.callPublicFn(contractName, "claim-rental-income", [Cl.uint(1), Cl.uint(1)], address2);
+      expect(claim1).toBeOk(Cl.uint(12000000)); // 30% of 40 STX = 12 STX
+      
+      const { result: claim2 } = simnet.callPublicFn(contractName, "claim-rental-income", [Cl.uint(1), Cl.uint(1)], address3);
+      expect(claim2).toBeOk(Cl.uint(16000000)); // 40% of 40 STX = 16 STX
+      
+      // 6. Secondary market trading
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(200), // Sell part of holdings
+        Cl.uint(1100000) // 10% premium
+      ], address2);
+      
+      const { result: tradeResult } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2),
+        Cl.uint(200)
+      ], address3);
+      expect(tradeResult).toBeOk(Cl.uint(1));
+      
+      // 7. Property appreciation
+      const { result: appreciationResult } = simnet.callPublicFn(contractName, "update-property-value", [
+        Cl.uint(1),
+        Cl.uint(2400000000) // 20% appreciation
+      ], address2);
+      expect(appreciationResult).toBeOk(Cl.bool(true));
+      
+      // 8. Verify final state
+      const { result: finalStats } = simnet.callReadOnlyFn(contractName, "get-property-stats", [Cl.uint(1)], address1);
+      expect(finalStats).toBeSome(
+        Cl.tuple({
+          "total-holders": Cl.uint(3),
+          "total-distributed": Cl.uint(40000000),
+          "last-distribution": Cl.uint(expect.any(Number)),
+          "appreciation-rate": Cl.uint(2000), // 20% = 2000 basis points
+        })
+      );
+    });
+
+    it("handles multiple properties with different characteristics", () => {
+      // Create different types of properties
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Luxury Apartment"),
+        Cl.stringUtf8("Manhattan"),
+        Cl.uint(5000000000), // High value
+        Cl.uint(5000),
+        Cl.uint(100000000) // High rent
+      ], address1);
+      
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Suburban House"),
+        Cl.stringUtf8("Queens"),
+        Cl.uint(800000000), // Lower value
+        Cl.uint(800),
+        Cl.uint(15000000) // Lower rent
+      ], address2);
+      
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Commercial Space"),
+        Cl.stringUtf8("Brooklyn"),
+        Cl.uint(3000000000), // Medium value
+        Cl.uint(3000),
+        Cl.uint(60000000) // Medium rent
+      ], address3);
+      
+      // Verify all properties
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(2)], address2);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(3)], address2);
+      
+      // Different investment patterns
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(1000)], deployer); // 20% of luxury
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(2), Cl.uint(400)], deployer); // 50% of suburban
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(3), Cl.uint(1500)], deployer); // 50% of commercial
+      
+      // Verify total properties
+      const { result: totalProperties } = simnet.callReadOnlyFn(contractName, "get-total-properties", [], deployer);
+      expect(totalProperties).toBeUint(3);
+    });
+
+    it("handles edge cases and error scenarios", () => {
+      // Create minimal property
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Minimal Property"),
+        Cl.stringUtf8("Basic Location"),
+        Cl.uint(1000000), // 1 STX minimum value
+        Cl.uint(1), // 1 token
+        Cl.uint(1000000) // 1 STX rent
+      ], address1);
+      
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      
+      // Purchase the single token
+      const { result } = simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(1)], address3);
+      expect(result).toBeOk(Cl.bool(true));
+      
+      // Verify ownership percentage is 100%
+      const { result: ownership } = simnet.callReadOnlyFn(contractName, "calculate-ownership-percentage", [
+        Cl.uint(1),
+        Cl.principal(address3)
+      ], address1);
+      expect(ownership).toBeOk(Cl.uint(10000)); // 100% = 10000 basis points
+      
+      // Try to purchase more tokens (should fail)
+      const { result: failedPurchase } = simnet.callPublicFn(contractName, "purchase-tokens", [
+        Cl.uint(1),
+        Cl.uint(1)
+      ], address2);
+      expect(failedPurchase).toBeErr(Cl.uint(103)); // err-insufficient-tokens
+    });
+
+    it("verifies portfolio calculation placeholder", () => {
+      // Test the portfolio calculation function (currently returns 0)
+      const { result } = simnet.callReadOnlyFn(contractName, "calculate-portfolio-value", [Cl.principal(address1)], address1);
+      expect(result).toBeOk(Cl.uint(0));
+    });
+
+    it("handles maximum property token limit", () => {
+      // Create property with maximum tokens
+      const { result } = simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Maximum Token Property"),
+        Cl.stringUtf8("Max Location"),
+        Cl.uint(10000000000), // 10,000 STX
+        Cl.uint(10000), // Maximum 10,000 tokens
+        Cl.uint(200000000) // 200 STX rent
+      ], address1);
+      
+      expect(result).toBeOk(Cl.uint(1));
+      
+      // Verify property details
+      const { result: property } = simnet.callReadOnlyFn(contractName, "get-property-details", [Cl.uint(1)], address1);
+      expect(property).toBeSome(
+        Cl.tuple({
+          owner: Cl.principal(address1),
+          title: Cl.stringUtf8("Maximum Token Property"),
+          location: Cl.stringUtf8("Max Location"),
+          "property-value": Cl.uint(10000000000),
+          "total-tokens": Cl.uint(10000),
+          "available-tokens": Cl.uint(10000),
+          "monthly-rent": Cl.uint(200000000),
+          verified: Cl.bool(false),
+          active: Cl.bool(false),
+          "created-at": Cl.uint(simnet.blockHeight),
+        })
+      );
+    });
+
+    it("handles complex secondary market scenarios", () => {
+      // Create property and establish multiple token holders
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Complex Trading Property"),
+        Cl.stringUtf8("Trading Hub"),
+        Cl.uint(3000000000), // 3000 STX
+        Cl.uint(3000), // 3000 tokens
+        Cl.uint(50000000) // 50 STX rent
+      ], address1);
+      
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      
+      // Multiple investors
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(1000)], address2);
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(800)], address3);
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(600)], deployer);
+      
+      // Multiple listings
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(300),
+        Cl.uint(1100000) // 10% premium
+      ], address2);
+      
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [
+        Cl.uint(1),
+        Cl.uint(200),
+        Cl.uint(950000) // 5% discount
+      ], address3);
+      
+      // Cross-trading between holders
+      const { result: trade1 } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address3), // Buy from address3 (discount price)
+        Cl.uint(150)
+      ], deployer);
+      expect(trade1).toBeOk(Cl.uint(1));
+      
+      const { result: trade2 } = simnet.callPublicFn(contractName, "buy-listed-tokens", [
+        Cl.uint(1),
+        Cl.principal(address2), // Buy from address2 (premium price)
+        Cl.uint(100)
+      ], address3);
+      expect(trade2).toBeOk(Cl.uint(2));
+      
+      // Verify multiple trade history entries
+      const { result: tradeHistory1 } = simnet.callReadOnlyFn(contractName, "get-trade-history", [
+        Cl.uint(1),
+        Cl.uint(1)
+      ], address1);
+      expect(tradeHistory1).toBeSome(
+        Cl.tuple({
+          seller: Cl.principal(address3),
+          buyer: Cl.principal(deployer),
+          "tokens-traded": Cl.uint(150),
+          "price-per-token": Cl.uint(950000),
+          "total-amount": Cl.uint(142500000), // 150 * 0.95 STX
+          "traded-at": Cl.uint(expect.any(Number)),
+        })
+      );
+      
+      const { result: tradeHistory2 } = simnet.callReadOnlyFn(contractName, "get-trade-history", [
+        Cl.uint(1),
+        Cl.uint(2)
+      ], address1);
+      expect(tradeHistory2).toBeSome(
+        Cl.tuple({
+          seller: Cl.principal(address2),
+          buyer: Cl.principal(address3),
+          "tokens-traded": Cl.uint(100),
+          "price-per-token": Cl.uint(1100000),
+          "total-amount": Cl.uint(110000000), // 100 * 1.1 STX
+          "traded-at": Cl.uint(expect.any(Number)),
+        })
+      );
+    });
+
+    it("validates read-only function responses for non-existent data", () => {
+      // Test all read-only functions with non-existent IDs
+      const { result: nonExistentProperty } = simnet.callReadOnlyFn(contractName, "get-property-details", [Cl.uint(999)], address1);
+      expect(nonExistentProperty).toBeNone();
+      
+      const { result: nonExistentStats } = simnet.callReadOnlyFn(contractName, "get-property-stats", [Cl.uint(999)], address1);
+      expect(nonExistentStats).toBeNone();
+      
+      const { result: nonExistentHoldings } = simnet.callReadOnlyFn(contractName, "get-token-holdings", [
+        Cl.uint(999),
+        Cl.principal(address1)
+      ], address1);
+      expect(nonExistentHoldings).toBeNone();
+      
+      const { result: nonExistentListing } = simnet.callReadOnlyFn(contractName, "get-token-listing", [
+        Cl.uint(999),
+        Cl.principal(address1)
+      ], address1);
+      expect(nonExistentListing).toBeNone();
+      
+      const { result: nonExistentTrade } = simnet.callReadOnlyFn(contractName, "get-trade-history", [
+        Cl.uint(999),
+        Cl.uint(999)
+      ], address1);
+      expect(nonExistentTrade).toBeNone();
+      
+      const { result: nonExistentDistribution } = simnet.callReadOnlyFn(contractName, "get-distribution-details", [
+        Cl.uint(999),
+        Cl.uint(999)
+      ], address1);
+      expect(nonExistentDistribution).toBeNone();
+      
+      const { result: nonExistentClaim } = simnet.callReadOnlyFn(contractName, "get-claim-details", [
+        Cl.uint(999),
+        Cl.uint(999),
+        Cl.principal(address1)
+      ], address1);
+      expect(nonExistentClaim).toBeNone();
+    });
+
+    it("handles platform fee accumulation and withdrawal", () => {
+      // Create property and make transactions to accumulate fees
+      simnet.callPublicFn(contractName, "create-property", [
+        Cl.stringUtf8("Fee Test Property"),
+        Cl.stringUtf8("Fee Location"),
+        Cl.uint(1000000000),
+        Cl.uint(1000),
+        Cl.uint(20000000)
+      ], address1);
+      
+      simnet.callPublicFn(contractName, "add-authorized-verifier", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(contractName, "verify-property", [Cl.uint(1)], address2);
+      
+      // Multiple token purchases (each generates platform fees)
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(100)], address2); // 2 STX fee
+      simnet.callPublicFn(contractName, "purchase-tokens", [Cl.uint(1), Cl.uint(200)], address3); // 4 STX fee
+      
+      // Secondary market trading (also generates fees)
+      simnet.callPublicFn(contractName, "list-tokens-for-sale", [Cl.uint(1), Cl.uint(50), Cl.uint(1200000)], address2);
+      simnet.callPublicFn(contractName, "buy-listed-tokens", [Cl.uint(1), Cl.principal(address2), Cl.uint(50)], address3); // Additional fee
+      
+      // Owner withdraws accumulated fees
+      const { result } = simnet.callPublicFn(contractName, "withdraw-platform-fees", [], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+    });
+  });
